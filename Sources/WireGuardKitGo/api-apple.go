@@ -59,6 +59,12 @@ type tunnelHandle struct {
 var tunnelHandles = make(map[int32]tunnelHandle)
 
 func init() {
+	// Reduce memory footprint for iOS Network Extension (CLE-299):
+	// - GCPercent(10): keep heap tight to live data, ~10-14 MB vs 16-21 MB
+	// - GOMAXPROCS(1): single peer, no parallelism needed, saves per-P mcache memory
+	debug.SetGCPercent(10)
+	runtime.GOMAXPROCS(1)
+
 	signals := make(chan os.Signal)
 	signal.Notify(signals, unix.SIGUSR2)
 	go func() {
