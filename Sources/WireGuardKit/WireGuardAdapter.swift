@@ -209,6 +209,37 @@ public class WireGuardAdapter {
         }
     }
 
+    /// Restart the WireGuard backend without tearing down the tunnel interface.
+    /// Used to recover from failed socket rebinding after network transitions.
+    /// - Parameter completionHandler: completion handler.
+    public func restartBackend(completionHandler: @escaping (WireGuardAdapterError?) -> Void) {
+        workQueue.async {
+            guard case .started(let handle, let settingsGenerator) = self.state else {
+                completionHandler(.invalidState)
+                return
+            }
+
+            self.logHandler(.verbose, "Restarting WireGuard backend to recover connectivity")
+
+            wgTurnOff(handle)
+
+            do {
+                let (wgConfig, resolutionResults) = settingsGenerator.uapiConfiguration()
+                self.logEndpointResolutionResults(resolutionResults)
+
+                self.state = .started(
+                    try self.startWireGuardBackend(wgConfig: wgConfig),
+                    settingsGenerator
+                )
+                completionHandler(nil)
+            } catch let error as WireGuardAdapterError {
+                completionHandler(error)
+            } catch {
+                fatalError()
+            }
+        }
+    }
+
     /// Stop the tunnel.
     /// - Parameter completionHandler: completion handler.
     public func stop(completionHandler: @escaping (WireGuardAdapterError?) -> Void) {
