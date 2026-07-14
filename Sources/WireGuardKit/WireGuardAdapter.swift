@@ -209,6 +209,73 @@ public class WireGuardAdapter {
         }
     }
 
+    /// Start the WireGuard backend WITHOUT installing tunnel network settings, so it
+    /// handshakes over its own UDP socket in the background while the routes already in place
+    /// (pass-through, during graceful-fail stand-down) stay untouched. The re-arm probe uses
+    /// this to confirm a real handshake lands BEFORE committing the route to the tunnel via
+    /// `commitNetworkSettings` — so a re-arm never blackholes traffic or interrupts an
+    /// in-progress captive-portal session (CLE-429).
+    ///
+    /// Requires the utun interface to already exist (pass-through settings installed it). If it
+    /// doesn't, `startWireGuardBackend` throws `.cannotLocateTunnelFileDescriptor` and the caller
+    /// falls back to a normal `start`. The backend reads no routed packets (nothing points at the
+    /// utun) but still handshakes, since the WireGuard socket is independent of the OS route table.
+    public func startBackendOnly(tunnelConfiguration: TunnelConfiguration, completionHandler: @escaping (WireGuardAdapterError?) -> Void) {
+        workQueue.async {
+            guard case .stopped = self.state else {
+                completionHandler(.invalidState)
+                return
+            }
+
+            let networkMonitor = NWPathMonitor()
+            networkMonitor.pathUpdateHandler = { [weak self] path in
+                self?.didReceivePathUpdate(path: path)
+            }
+            networkMonitor.start(queue: self.workQueue)
+
+            do {
+                let settingsGenerator = try self.makeSettingsGenerator(with: tunnelConfiguration)
+                // Deliberately NOT calling setNetworkSettings: the current (pass-through) routes
+                // stay in place until commitNetworkSettings() flips them to the tunnel.
+                let (wgConfig, resolutionResults) = settingsGenerator.uapiConfiguration()
+                self.logEndpointResolutionResults(resolutionResults)
+
+                self.state = .started(
+                    try self.startWireGuardBackend(wgConfig: wgConfig),
+                    settingsGenerator
+                )
+                self.networkMonitor = networkMonitor
+                completionHandler(nil)
+            } catch let error as WireGuardAdapterError {
+                networkMonitor.cancel()
+                completionHandler(error)
+            } catch {
+                fatalError()
+            }
+        }
+    }
+
+    /// Install the tunnel's network settings (routes) for a backend started via
+    /// `startBackendOnly` — flips the default route from pass-through to the tunnel once a
+    /// handshake has been confirmed. No backend restart; the running, already-handshaked
+    /// backend just starts receiving routed traffic. (CLE-429)
+    public func commitNetworkSettings(completionHandler: @escaping (WireGuardAdapterError?) -> Void) {
+        workQueue.async {
+            guard case .started(_, let settingsGenerator) = self.state else {
+                completionHandler(.invalidState)
+                return
+            }
+            do {
+                try self.setNetworkSettings(settingsGenerator.generateNetworkSettings())
+                completionHandler(nil)
+            } catch let error as WireGuardAdapterError {
+                completionHandler(error)
+            } catch {
+                fatalError()
+            }
+        }
+    }
+
     /// Restart the WireGuard backend without tearing down the tunnel interface.
     /// Used to recover from failed socket rebinding after network transitions.
     /// - Parameter completionHandler: completion handler.
