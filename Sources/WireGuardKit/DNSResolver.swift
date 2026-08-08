@@ -69,20 +69,24 @@ extension DNSResolver {
         }
 
         for addrInfo in iterator {
-            if let maybeIpv4Address = IPv4Address(addrInfo: addrInfo) {
-                ipv4Address = maybeIpv4Address
-                break // If we found an IPv4 address, we can stop
-            } else if let maybeIpv6Address = IPv6Address(addrInfo: addrInfo) {
+            if let maybeIpv6Address = IPv6Address(addrInfo: addrInfo) {
                 ipv6Address = maybeIpv6Address
-                continue // If we already have an IPv6 address, we can skip this one
+                break // Found an IPv6 address; we prefer it, stop scanning.
+            } else if let maybeIpv4Address = IPv4Address(addrInfo: addrInfo) {
+                ipv4Address = maybeIpv4Address
+                continue // Keep an IPv4 fallback in case there is no IPv6.
             }
         }
 
-        // We prefer an IPv4 address over an IPv6 address
-        if let ipv4Address = ipv4Address {
-            return Endpoint(host: .ipv4(ipv4Address), port: endpoint.port)
-        } else if let ipv6Address = ipv6Address {
+        // Prefer IPv6 over IPv4. Matches RFC 6724 default destination-address
+        // selection and what iOS's higher-level URLSession / NWConnection APIs do.
+        // The previous IPv4 preference here meant tunnels on IPv6-primary cellular
+        // links (T-Mobile, Verizon 5G UW) silently picked the A record and broke
+        // whenever the carrier's CLAT/NAT64 hit a brittle state. See CLE-373 / CLE-375.
+        if let ipv6Address = ipv6Address {
             return Endpoint(host: .ipv6(ipv6Address), port: endpoint.port)
+        } else if let ipv4Address = ipv4Address {
+            return Endpoint(host: .ipv4(ipv4Address), port: endpoint.port)
         } else {
             // Must never happen
             fatalError()
