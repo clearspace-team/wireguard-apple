@@ -353,6 +353,33 @@ public class WireGuardAdapter {
         }
     }
 
+    /// Rebind in place: what a network change does (`didReceivePathUpdate`), plus a fresh random
+    /// UDP port. Re-resolves the endpoint, reloads it, and rebinds the socket; the backend, its
+    /// session keys and the routes stay. Data sent from the new port lets the server roam the
+    /// peer to it, so a flow that died on the old port (observed: both directions dead, a new
+    /// socket fixes it) can recover without a handshake or a no-tunnel gap.
+    /// - Parameter completionHandler: completion handler; `.invalidState` unless started.
+    public func rebind(completionHandler: @escaping (WireGuardAdapterError?) -> Void) {
+        workQueue.async {
+            guard case .started(let handle, let settingsGenerator) = self.state else {
+                completionHandler(.invalidState)
+                return
+            }
+            self.logHandler(.verbose, "Rebinding WireGuard socket in place (fresh port, as on a network change)")
+
+            // listen_port=0: wireguard-go rebinds on a new random port (BindUpdate would reuse the old one).
+            wgSetConfig(handle, "listen_port=0\n")
+            let (wgConfig, resolutionResults) = settingsGenerator.endpointUapiConfiguration()
+            self.logEndpointResolutionResults(resolutionResults)
+            wgSetConfig(handle, wgConfig)
+            #if os(iOS)
+            wgDisableSomeRoamingForBrokenMobileSemantics(handle)
+            #endif
+            wgBumpSockets(handle)
+            completionHandler(nil)
+        }
+    }
+
     /// Stop the tunnel.
     /// - Parameter completionHandler: completion handler.
     public func stop(completionHandler: @escaping (WireGuardAdapterError?) -> Void) {
