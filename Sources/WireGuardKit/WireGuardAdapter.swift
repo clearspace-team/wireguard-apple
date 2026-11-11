@@ -306,53 +306,6 @@ public class WireGuardAdapter {
         }
     }
 
-    /// Restart the WireGuard backend in process: turn the Go backend off and start a new one
-    /// (new UDP socket and source port) from the cached endpoint resolution — no DNS lookup, no
-    /// `setTunnelNetworkSettings`, no `startTunnel`. The tunnel's routes and DNS stay installed
-    /// the whole time, so traffic keeps going into the utun and is dropped (not leaked) until the
-    /// new backend is up; nothing ever leaves the tunnel unfiltered. The cheap health recovery
-    /// before `cancelTunnelWithError`, which leaves a window with no tunnel at all and then
-    /// re-resolves the endpoint name (fails offline). Also recovers a backend that closed its
-    /// TUN device: wireguard-go only ever closes its own dup of the utun fd.
-    ///
-    /// `reasserting` is true for the duration ("reconnecting" to the system and the app) and is
-    /// reset on every exit path. Errors with `.invalidState` unless the backend is running
-    /// (`.stopped`, or `.temporaryShutdown` while the path is offline). If the new backend fails
-    /// to start, the adapter parks in `.temporaryShutdown` (backend off, settings still in place,
-    /// `stop` works, a later path update retries) and reports the error.
-    /// - Parameter completionHandler: completion handler, on the adapter's work queue.
-    public func restartBackend(completionHandler: @escaping (WireGuardAdapterError?) -> Void) {
-        workQueue.async {
-            guard case .started(let handle, let settingsGenerator) = self.state else {
-                completionHandler(.invalidState)
-                return
-            }
-
-            self.packetTunnelProvider?.reasserting = true
-            defer { self.packetTunnelProvider?.reasserting = false }
-
-            self.logHandler(.verbose, "Restarting WireGuard backend in process (network settings unchanged)")
-
-            wgTurnOff(handle)
-
-            do {
-                let (wgConfig, resolutionResults) = settingsGenerator.uapiConfiguration()
-                self.logEndpointResolutionResults(resolutionResults)
-
-                self.state = .started(
-                    try self.startWireGuardBackend(wgConfig: wgConfig),
-                    settingsGenerator
-                )
-                completionHandler(nil)
-            } catch let error as WireGuardAdapterError {
-                self.state = .temporaryShutdown(settingsGenerator)
-                completionHandler(error)
-            } catch {
-                fatalError()
-            }
-        }
-    }
-
     /// Rebind in place: what a network change does (`didReceivePathUpdate`), plus a fresh random
     /// UDP port. Re-resolves the endpoint, reloads it, and rebinds the socket; the backend, its
     /// session keys and the routes stay. Data sent from the new port lets the server roam the
