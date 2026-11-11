@@ -62,6 +62,9 @@ public class WireGuardAdapter {
     /// settings: every `setTunnelNetworkSettings` is a chance for the TUN race described on
     /// `commitNetworkSettings`.
     private var appliedSettingsGenerator: PacketTunnelSettingsGenerator?
+    /// Started by `startBackendOnly` and not yet committed: the OS routes are someone else's
+    /// (pass-through), so a path-change resume must not install the tunnel's.
+    private var backendOnly = false
 
     /// Tunnel device file descriptor.
     private var tunnelFileDescriptor: Int32? {
@@ -198,6 +201,7 @@ public class WireGuardAdapter {
                 let settingsGenerator = try self.makeSettingsGenerator(with: tunnelConfiguration)
                 try self.setNetworkSettings(settingsGenerator.generateNetworkSettings())
                 self.appliedSettingsGenerator = settingsGenerator
+                self.backendOnly = false
 
                 let (wgConfig, resolutionResults) = settingsGenerator.uapiConfiguration()
                 self.logEndpointResolutionResults(resolutionResults)
@@ -246,6 +250,7 @@ public class WireGuardAdapter {
                 // Deliberately NOT calling setNetworkSettings: the current (pass-through) routes
                 // stay in place until commitNetworkSettings() flips them to the tunnel.
                 self.appliedSettingsGenerator = nil
+                self.backendOnly = true
                 let (wgConfig, resolutionResults) = settingsGenerator.uapiConfiguration()
                 self.logEndpointResolutionResults(resolutionResults)
 
@@ -287,6 +292,7 @@ public class WireGuardAdapter {
             do {
                 try self.setNetworkSettings(settingsGenerator.generateNetworkSettings())
                 self.appliedSettingsGenerator = settingsGenerator
+                self.backendOnly = false
 
                 let (wgConfig, resolutionResults) = settingsGenerator.uapiConfiguration()
                 self.logEndpointResolutionResults(resolutionResults)
@@ -299,6 +305,7 @@ public class WireGuardAdapter {
                 self.networkMonitor?.cancel()
                 self.networkMonitor = nil
                 self.state = .stopped
+                self.backendOnly = false
                 completionHandler(error)
             } catch {
                 fatalError()
@@ -354,6 +361,7 @@ public class WireGuardAdapter {
 
             self.state = .stopped
             self.appliedSettingsGenerator = nil
+            self.backendOnly = false
 
             completionHandler(nil)
         }
@@ -382,6 +390,7 @@ public class WireGuardAdapter {
                 let settingsGenerator = try self.makeSettingsGenerator(with: tunnelConfiguration)
                 try self.setNetworkSettings(settingsGenerator.generateNetworkSettings())
                 self.appliedSettingsGenerator = settingsGenerator
+                self.backendOnly = false
 
                 switch self.state {
                 case .started(let handle, _):
@@ -578,7 +587,9 @@ public class WireGuardAdapter {
                 // wireguard-go's device ("no buffer space available", see
                 // `commitNetworkSettings`), and the cached generator's settings are unchanged
                 // across an offline spell.
-                if self.appliedSettingsGenerator !== settingsGenerator {
+                if self.backendOnly {
+                    self.logHandler(.verbose, "Backend-only probe: leaving the current routes in place.")
+                } else if self.appliedSettingsGenerator !== settingsGenerator {
                     try self.setNetworkSettings(settingsGenerator.generateNetworkSettings())
                     self.appliedSettingsGenerator = settingsGenerator
                 } else {
