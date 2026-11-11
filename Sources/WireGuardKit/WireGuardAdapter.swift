@@ -56,6 +56,16 @@ public class WireGuardAdapter {
     /// Adapter state.
     private var state: State = .stopped
 
+    /// The settings generator whose network settings this adapter last installed and that are
+    /// still in place (nil once the adapter stops, or when `startBackendOnly` runs under settings
+    /// someone else installed). Lets the offline→online resume skip re-applying identical
+    /// settings: every `setTunnelNetworkSettings` is a chance for the TUN race described on
+    /// `commitNetworkSettings`.
+    private var appliedSettingsGenerator: PacketTunnelSettingsGenerator?
+    /// Started by `startBackendOnly` and not yet committed: the OS routes are someone else's
+    /// (pass-through), so a path-change resume must not install the tunnel's.
+    private var backendOnly = false
+
     /// Tunnel device file descriptor.
     private var tunnelFileDescriptor: Int32? {
         var ctlInfo = ctl_info()
@@ -190,6 +200,8 @@ public class WireGuardAdapter {
             do {
                 let settingsGenerator = try self.makeSettingsGenerator(with: tunnelConfiguration)
                 try self.setNetworkSettings(settingsGenerator.generateNetworkSettings())
+                self.appliedSettingsGenerator = settingsGenerator
+                self.backendOnly = false
 
                 let (wgConfig, resolutionResults) = settingsGenerator.uapiConfiguration()
                 self.logEndpointResolutionResults(resolutionResults)
@@ -237,6 +249,8 @@ public class WireGuardAdapter {
                 let settingsGenerator = try self.makeSettingsGenerator(with: tunnelConfiguration)
                 // Deliberately NOT calling setNetworkSettings: the current (pass-through) routes
                 // stay in place until commitNetworkSettings() flips them to the tunnel.
+                self.appliedSettingsGenerator = nil
+                self.backendOnly = true
                 let (wgConfig, resolutionResults) = settingsGenerator.uapiConfiguration()
                 self.logEndpointResolutionResults(resolutionResults)
 
@@ -257,18 +271,41 @@ public class WireGuardAdapter {
 
     /// Install the tunnel's network settings (routes) for a backend started via
     /// `startBackendOnly` — flips the default route from pass-through to the tunnel once a
-    /// handshake has been confirmed. No backend restart; the running, already-handshaked
-    /// backend just starts receiving routed traffic. (CLE-429)
+    /// handshake has been confirmed.
+    ///
+    /// The probe backend is turned OFF before the settings are applied and a fresh one is
+    /// started after, never applied onto the live backend: `setTunnelNetworkSettings` while
+    /// wireguard-go is reading the utun can fail that read ("Failed to read packet from TUN
+    /// device: route ip+net: no buffer space available"), and wireguard-go closes its device on
+    /// any TUN read error — every later call logs "device closed" and the tunnel is a zombie
+    /// with its routes still installed (no internet, no stats). The new backend handshakes
+    /// again over the endpoint the probe just proved. While the settings land nothing reads the
+    /// utun, so routed packets are dropped, not leaked. On failure the adapter is left stopped
+    /// (backend off, path monitor cancelled); the caller falls back to a full relaunch.
     public func commitNetworkSettings(completionHandler: @escaping (WireGuardAdapterError?) -> Void) {
         workQueue.async {
-            guard case .started(_, let settingsGenerator) = self.state else {
+            guard case .started(let handle, let settingsGenerator) = self.state else {
                 completionHandler(.invalidState)
                 return
             }
+            wgTurnOff(handle)
             do {
                 try self.setNetworkSettings(settingsGenerator.generateNetworkSettings())
+                self.appliedSettingsGenerator = settingsGenerator
+                self.backendOnly = false
+
+                let (wgConfig, resolutionResults) = settingsGenerator.uapiConfiguration()
+                self.logEndpointResolutionResults(resolutionResults)
+                self.state = .started(
+                    try self.startWireGuardBackend(wgConfig: wgConfig),
+                    settingsGenerator
+                )
                 completionHandler(nil)
             } catch let error as WireGuardAdapterError {
+                self.networkMonitor?.cancel()
+                self.networkMonitor = nil
+                self.state = .stopped
+                self.backendOnly = false
                 completionHandler(error)
             } catch {
                 fatalError()
@@ -276,34 +313,30 @@ public class WireGuardAdapter {
         }
     }
 
-    /// Restart the WireGuard backend without tearing down the tunnel interface.
-    /// Used to recover from failed socket rebinding after network transitions.
-    /// - Parameter completionHandler: completion handler.
-    public func restartBackend(completionHandler: @escaping (WireGuardAdapterError?) -> Void) {
+    /// Rebind in place: what a network change does (`didReceivePathUpdate`), plus a fresh random
+    /// UDP port. Re-resolves the endpoint, reloads it, and rebinds the socket; the backend, its
+    /// session keys and the routes stay. Data sent from the new port lets the server roam the
+    /// peer to it, so a flow that died on the old port (observed: both directions dead, a new
+    /// socket fixes it) can recover without a handshake or a no-tunnel gap.
+    /// - Parameter completionHandler: completion handler; `.invalidState` unless started.
+    public func rebind(completionHandler: @escaping (WireGuardAdapterError?) -> Void) {
         workQueue.async {
             guard case .started(let handle, let settingsGenerator) = self.state else {
                 completionHandler(.invalidState)
                 return
             }
+            self.logHandler(.verbose, "Rebinding WireGuard socket in place (fresh port, as on a network change)")
 
-            self.logHandler(.verbose, "Restarting WireGuard backend to recover connectivity")
-
-            wgTurnOff(handle)
-
-            do {
-                let (wgConfig, resolutionResults) = settingsGenerator.uapiConfiguration()
-                self.logEndpointResolutionResults(resolutionResults)
-
-                self.state = .started(
-                    try self.startWireGuardBackend(wgConfig: wgConfig),
-                    settingsGenerator
-                )
-                completionHandler(nil)
-            } catch let error as WireGuardAdapterError {
-                completionHandler(error)
-            } catch {
-                fatalError()
-            }
+            // listen_port=0: wireguard-go rebinds on a new random port (BindUpdate would reuse the old one).
+            wgSetConfig(handle, "listen_port=0\n")
+            let (wgConfig, resolutionResults) = settingsGenerator.endpointUapiConfiguration()
+            self.logEndpointResolutionResults(resolutionResults)
+            wgSetConfig(handle, wgConfig)
+            #if os(iOS)
+            wgDisableSomeRoamingForBrokenMobileSemantics(handle)
+            #endif
+            wgBumpSockets(handle)
+            completionHandler(nil)
         }
     }
 
@@ -327,6 +360,8 @@ public class WireGuardAdapter {
             self.networkMonitor = nil
 
             self.state = .stopped
+            self.appliedSettingsGenerator = nil
+            self.backendOnly = false
 
             completionHandler(nil)
         }
@@ -354,6 +389,8 @@ public class WireGuardAdapter {
             do {
                 let settingsGenerator = try self.makeSettingsGenerator(with: tunnelConfiguration)
                 try self.setNetworkSettings(settingsGenerator.generateNetworkSettings())
+                self.appliedSettingsGenerator = settingsGenerator
+                self.backendOnly = false
 
                 switch self.state {
                 case .started(let handle, _):
@@ -540,8 +577,24 @@ public class WireGuardAdapter {
 
             self.logHandler(.verbose, "Connectivity online, resuming backend.")
 
+            // Reconnecting: the backend is off and routes still point into the utun.
+            self.packetTunnelProvider?.reasserting = true
+            defer { self.packetTunnelProvider?.reasserting = false }
+
             do {
-                try self.setNetworkSettings(settingsGenerator.generateNetworkSettings())
+                // Settings are applied while the backend is OFF and only when they differ from
+                // what is installed: `setTunnelNetworkSettings` racing a TUN read is what closes
+                // wireguard-go's device ("no buffer space available", see
+                // `commitNetworkSettings`), and the cached generator's settings are unchanged
+                // across an offline spell.
+                if self.backendOnly {
+                    self.logHandler(.verbose, "Backend-only probe: leaving the current routes in place.")
+                } else if self.appliedSettingsGenerator !== settingsGenerator {
+                    try self.setNetworkSettings(settingsGenerator.generateNetworkSettings())
+                    self.appliedSettingsGenerator = settingsGenerator
+                } else {
+                    self.logHandler(.verbose, "Network settings unchanged; not re-applying.")
+                }
 
                 let (wgConfig, resolutionResults) = settingsGenerator.uapiConfiguration()
                 self.logEndpointResolutionResults(resolutionResults)
